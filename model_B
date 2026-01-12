@@ -1,0 +1,805 @@
+import os
+os.environ["TMPDIR"] = "/cosma8/data/dp058/dc-whit3/Lyon/B-n_paper_2/tmp_C/"
+import logging
+import numpy as np
+import matplotlib.pyplot as plt
+import arviz as az
+import xarray as xr
+from cmdstanpy import CmdStanModel
+from scipy.stats import gaussian_kde
+import corner
+
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.labelweight": "normal",
+    "axes.linewidth": 1.5,
+    "xtick.labelsize": 14,
+    "ytick.labelsize": 14,
+})
+
+def load_data(filename, fix=True, orig=False):
+    data = np.load(filename)
+    print('data shape = ',data.shape)
+    if fix:
+        k = np.nonzero((data[:, 0] > 0) & #(data[:, 1] > 0) &
+                       (data[:, 2] > 0) & (data[:, 3] > 0))[0]
+        if len(k) < len(data):
+            print("Restricting data to positive X, Y, Xerr, Yerr...")
+            data = data[k]
+    if not orig:
+        Xmin = np.log10(np.nanmin(data[:, 0]))
+        Ymin = np.log10(np.nanmin(data[:, 2]))
+        X = np.log10(data[:, 0]) - Xmin
+        Xerr = data[:, 1] / data[:, 0] / np.log(10.0)
+        Y = np.log10(data[:, 2]) - Ymin
+        Yerr = data[:, 3] / data[:, 2] / np.log(10.0)
+    else:
+        Xmin = np.nanmin(data[:, 0])
+        Ymin = np.nanmin(data[:, 2])
+        X = data[:, 0]
+        Xerr = data[:, 1]
+        Y = data[:, 2]
+        Yerr = data[:, 3]
+    print('lowest value of n = ', np.min(Y))
+    return X, Xerr, Xmin, Y, Yerr, Ymin
+
+def model_predict(logB0, logn0, alpha1, alpha2, X, Xmin, Ymin, n_shift=True):
+    if not n_shift:
+        logn0 = logn0 - Xmin
+    Y_pred_log_shifted = np.where(
+        X <= logn0,
+        logB0 + alpha1 * (X - logn0),
+        logB0 + alpha2 * (X - logn0)
+    )
+    exp_arg = Y_pred_log_shifted + Ymin
+    exp_arg = np.clip(exp_arg, -300.0, 300.0)
+    Y_pred = 10.0 ** exp_arg
+    Y_pred[~np.isfinite(Y_pred)] = np.nan
+    return Y_pred
+
+def _to_linear_from_shifted_log(arr, min_val_log):
+    arr = np.asarray(arr, dtype=np.float64)
+    finite = np.isfinite(arr)
+    max_abs = float(np.nanmax(np.abs(arr[finite]))) if np.any(finite) else 0.0
+    if (max_abs < 50.0) and (abs(min_val_log) < 50.0):
+        exp_arg = np.clip(arr + min_val_log, -300.0, 300.0)
+        out = 10.0 ** exp_arg
+    else:
+        out = arr.copy().astype(np.float64)
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+def get_param(posterior, names, fallback=None):
+    for n in names:
+        if n in posterior:
+            arr = posterior[n].values
+            # Only flatten if it's a scalar parameter (ndim == 2, shape = (chain, draw))
+            if arr.ndim == 2:
+                arr_flat = arr.flatten()
+                if arr_flat.size and not np.all(np.isnan(arr_flat)):
+                    return arr
+            elif arr.ndim == 1: # e.g. already flattened chain*draw
+                if arr.size and not np.all(np.isnan(arr)):
+                    return arr
+            # If it's a vector (ndim==3), skip -- handle vector params elsewhere!
+            continue
+    if fallback is not None:
+        return fallback * np.ones([1])
+    return None
+
+def reshape_param(arr, n_chain, n_draw):
+    arr = np.asarray(arr)
+    if arr.ndim == 2:
+        return arr
+    elif arr.ndim == 1:
+        if arr.size == n_chain * n_draw:
+            return arr.reshape(n_chain, n_draw)
+        elif arr.size == n_draw:
+            return arr.reshape(1, n_draw)
+        elif arr.size == n_chain:
+            return arr.reshape(n_chain, 1)
+        else:
+            # Vector parameter or incompatible shape!
+            raise RuntimeError(f"Incompatible array shape for chain/draw reshaping: {arr.shape}")
+    else:
+        raise RuntimeError(f"Parameter shape not recognized: {arr.shape}")
+
+def posterior_predictive_plot(posterior_predictive, data, Ymin, credible_interval=[2.5, 97.5],
+                              file_suffix="", outdir=""):
+    """
+    Plot posterior predictive credible intervals computed per observed bin.
+
+    posterior_predictive: expects an xarray.Dataset or arviz.InferenceData.posterior_predictive
+                          containing 'y_rep' in absolute log10 space with shape
+                          either (draw, obs) or (chain, draw, obs).
+    data: linear/original data tuple from load_data(..., orig=True).
+    """
+    import xarray as xr
+
+    X_lin, Xerr_lin, Xmin_lin, Y_lin, Yerr_lin, Ymin_lin = data
+
+    # Accept either DataSet (posterior_predictive) or InferenceData.posterior_predictive
+    if isinstance(posterior_predictive, xr.Dataset):
+        pp = posterior_predictive
+    else:
+        # posterior_predictive might be an InferenceData.posterior_predictive group
+        pp = posterior_predictive
+
+    if "y_rep" not in pp.data_vars:
+        raise KeyError("'y_rep' not found in posterior_predictive")
+
+    y_rep = pp["y_rep"].values
+
+    # Normalize to shape (n_draws_total, n_obs)
+    if y_rep.ndim == 3:
+        n_chain, n_draw, n_obs = y_rep.shape
+        y_rep_2d = y_rep.reshape(n_chain * n_draw, n_obs)
+    elif y_rep.ndim == 2:
+        y_rep_2d = y_rep
+        n_obs = y_rep_2d.shape[1]
+    else:
+        raise RuntimeError(f"Unexpected y_rep.ndim = {y_rep.ndim}")
+
+    if y_rep_2d.shape[1] != X_lin.size:
+        # try transpose if obviously swapped
+        if y_rep_2d.shape[0] == X_lin.size and y_rep_2d.shape[1] != X_lin.size:
+            y_rep_2d = y_rep_2d.T
+        else:
+            raise RuntimeError(f"y_rep has {y_rep_2d.shape[1]} obs but data X has {X_lin.size}")
+
+    # convert to linear for plotting
+    y_rep_lin = 10.0 ** (y_rep_2d + Ymin)
+
+    lower_bound = np.percentile(y_rep_lin, credible_interval[0], axis=0)
+    median = np.percentile(y_rep_lin, 50, axis=0)
+    upper_bound = np.percentile(y_rep_lin, credible_interval[1], axis=0)
+
+    sort_idx = np.argsort(X_lin)
+    X_sorted = X_lin[sort_idx]
+    Xerr_sorted = Xerr_lin[sort_idx]
+    lower_sorted = lower_bound[sort_idx]
+    median_sorted = median[sort_idx]
+    upper_sorted = upper_bound[sort_idx]
+    Y_sorted = Y_lin[sort_idx]
+    Yerr_sorted = Yerr_lin[sort_idx]
+    
+    plt.figure(figsize=(10, 6))
+    plt.fill_between(X_sorted, lower_sorted, upper_sorted, color="lightblue", alpha=0.5,
+                     label=f"{credible_interval[0]}-{credible_interval[1]}% CI")
+    plt.plot(X_sorted, median_sorted, color="purple", label="Median Prediction")
+
+    crut_x = np.linspace(300, 1e10)
+    B_0 = 10.0; n_0 = 300.0; k = (2.0 / 3.0)
+    crut_y = B_0 * ((crut_x / n_0) ** k)
+    plt.hlines(y=10.0, xmin=1.0, xmax=300.0, colors="k", linewidth=2, zorder=2)
+    plt.plot(crut_x, crut_y, "k", linewidth=2, label="Crutcher et. al '10", zorder=2)
+
+    plt.errorbar(X_sorted, Y_sorted, yerr=Yerr_sorted,
+                 fmt="o", color="black", alpha=0.5, label="Zeeman")   #xerr=Xerr_sorted,
+
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.tick_params(labelsize=20, width=2, length=10)
+    plt.xlabel(r"log$_{10}$(n) [cm$^{-3}$]", fontsize=26)
+    plt.ylabel(r"log$_{10}$(|B|) [$\mu$G]", fontsize=26)
+    plt.ylim(0.01, 1e4)
+    #plt.xlim(0.001, 2e7)
+    plt.xlim(8.0, 2e7)          #for zeeman data
+    plt.legend(loc="upper left", fontsize = 18, ncol = 2)
+    plt.grid(which="major", axis="both", zorder=0)
+    plt.tight_layout()
+    if outdir:
+        os.makedirs(outdir, exist_ok=True)
+        fname = f"{outdir}posterior_predictive_{file_suffix}.png" if file_suffix else f"{outdir}posterior_predictive.png"
+        plt.savefig(fname)
+    else:
+        plt.show()
+
+def summary_table(idata=None, outdir="", low_density=False):
+    print("Generating summary table...")
+    if idata is None:
+        if outdir and outdir[-1] != "/":
+            outdir += "/"
+        idata = az.from_netcdf(f"{outdir}fit_fb.nc")
+    posterior = idata.posterior
+
+    def get_psamp(param):
+        if param in ["alpha_1", "alpha_2"]:
+            return posterior[param].values if param in posterior else np.nan
+        if param == "n_0":
+            arr = get_param(posterior, ["n_0"])
+            if arr is not None and np.all(np.isfinite(arr)):
+                return arr
+            arr_log = get_param(posterior, ["log10(n_0)", "log10n_0_shifted"])
+            return 10**arr_log if arr_log is not None else np.nan
+        if param == "B_0":
+            arr = get_param(posterior, ["B_0"])
+            if arr is not None:
+                return arr
+            arr_log = get_param(posterior, ["log10(B_0)", "log10B_0_shifted"])
+            return 10**arr_log if arr_log is not None else np.nan
+        if param == "f_B":
+            arr = get_param(posterior, ["f_B"])
+            if arr is not None:
+                return arr
+            arr_log = get_param(posterior, ["log10_f_B"])
+            return 10**arr_log if arr_log is not None else np.nan
+        if param == "sigma_y":
+            arr = get_param(posterior, ["sigma_y"])
+            return arr if arr is not None else np.nan
+        raise KeyError(f"Unsupported parameter {param}")
+    
+    pars = ["alpha_1", "alpha_2", "n_0", "B_0"]
+    if "log10_f_B" in posterior or "f_B" in posterior:
+        pars.append("f_B")
+    if "sigma_y" in posterior:
+        pars.append("sigma_y")
+    if "log10_f_n" in posterior or "f_n" in posterior:
+        pars.append("R")
+    az.rcParams["stats.ci_prob"] = 0.68
+
+    header_row, map_row, median_row = "", "", ""
+
+    labels = {
+        "alpha_1": r"$\alpha_1$",
+        "alpha_2": r"$\alpha_2$",
+        "n_0": r"$n_0\,({\rm cm}^{-3})$",
+        "B_0": r"$B_0\,(\mu{\rm G})$",
+        "f_B": r"$f_B$",
+        "sigma_y": r"$\sigma_B$"
+    }
+
+    for p in pars:
+        lab = labels.get(p, p)
+        header_row += f"{lab} & "    
+    for param in pars:
+        try:
+            arr = get_psamp(param)
+        except KeyError:
+            map_row += "N/A & "
+            continue
+        arr_flat = arr.flatten()
+        if np.all(np.isnan(arr_flat)):
+            map_row += "N/A & "
+            continue
+
+    lp_arr = idata.sample_stats["lp"].values
+    shape = lp_arr.shape
+    chain_idx, draw_idx = np.unravel_index(np.argmax(lp_arr), shape)
+    n_chains, n_draws = shape
+
+    # MAP + HPD row
+    map_row = ""
+    median_row = ""
+    for param in pars:
+        try:
+            arr = get_psamp(param)
+        except KeyError:
+            map_row += "N/A & "
+            median_row += "N/A & "
+            continue
+        arr_flat = arr.flatten()
+        if np.all(np.isnan(arr_flat)):
+            map_row += "N/A & "
+            median_row += "N/A & "
+            continue
+        map_idx = chain_idx * n_draws + draw_idx
+        map_val = arr_flat[map_idx]
+        hpd_low, hpd_high = az.hdi(arr_flat, hdi_prob=0.68)
+        lower_str = f"{abs(map_val - hpd_low):.2f}"
+        upper_str = f"{abs(hpd_high - map_val):.2f}"
+        map_row += f"${map_val:.2f}_{{-{lower_str}}}^{{+{upper_str}}}$ & "
+        p16, p50, p84 = np.percentile(arr_flat, [16, 50, 84])
+        median_row += f"${p50:.2f}_{{-{p50-p16:.2f}}}^{{+{p84-p50:.2f}}}$ & "
+
+    print(header_row + "\\\\")
+    print(map_row + "\\\\")
+    print(median_row + "\\\\")
+    return [header_row + "\\\\", map_row + "\\\\", median_row + "\\\\"]
+
+def posterior_fit(posterior_or_idata, data, num_lines=100, outdir="", file_suffix="", xerr_sample_size=40):
+    # Compatible unpacking
+    if hasattr(posterior_or_idata, "posterior"):
+        posterior_ds = posterior_or_idata.posterior
+        idata_obj = posterior_or_idata
+    else:
+        posterior_ds = posterior_or_idata
+        idata_obj = None
+    X, Xerr, Xmin, Y, Yerr, Ymin = data
+
+    n_samples = len(get_param(posterior_ds, ["alpha_1"], fallback=0))
+    alpha_1_samples = get_param(posterior_ds, ["alpha_1"], 0)
+    alpha_2_samples = get_param(posterior_ds, ["alpha_2"], 0)
+    n0_lin = get_param(posterior_ds, ["n_0"])
+    if n0_lin is None:
+        n0_log = get_param(posterior_ds, ["log10(n_0)", "log10n_0"])
+        if n0_log is not None:
+            n0_lin = 10.0 ** n0_log
+        else:
+            n0_lin = np.full(n_samples, 300.0)
+    B0_true = get_param(posterior_ds, ["B_0_true", "B_0"])
+    if B0_true is None:
+        B0_log = get_param(posterior_ds, ["log10(B_0)", "log10B_0_shifted"])
+        if B0_log is not None:
+            B0_true = 10.0 ** B0_log
+        else:
+            B0_true = np.full(n_samples, 10.0)
+    
+    def to_chain(arr):
+        arr = np.asarray(arr)
+        if arr.ndim == 2: return arr
+        return arr.reshape((1, arr.size))
+    a1_cd = to_chain(alpha_1_samples)
+    a2_cd = to_chain(alpha_2_samples)
+    n0_cd = to_chain(n0_lin)
+    B0_cd = to_chain(B0_true)
+    min_len = min([v.size for v in [a1_cd, a2_cd, n0_cd, B0_cd]])
+    max_plot_draws = min(5000, min_len)
+    rng = np.random.default_rng()
+    idx = rng.choice(min_len, size=max_plot_draws, replace=False)
+    posterior_samples = np.column_stack([
+        a1_cd.flatten()[idx], a2_cd.flatten()[idx], n0_cd.flatten()[idx], B0_cd.flatten()[idx]])
+
+    X_raw_min, X_raw_max = 10 ** Xmin, 10 ** (Xmin + float(np.nanmax(X)))
+    X_plot = np.geomspace(X_raw_min, X_raw_max, 137)
+    X_plot_log_shifted = np.log10(X_plot) - Xmin  # shifted log(n)
+
+    # Plot sample lines
+    plt.figure(figsize=(10, 6))
+    for s in range(num_lines):
+        a1, a2, n0, B0t = posterior_samples[rng.integers(max_plot_draws)]
+        logB0t_shifted = np.log10(B0t) - Ymin
+        logn0 = np.log10(n0) - Xmin
+        Y_line = model_predict(logB0t_shifted, logn0, a1, a2,
+                              X_plot_log_shifted, Xmin, Ymin, True)
+        plt.plot(X_plot, Y_line, color="lightblue", alpha=0.2)
+
+    # MAP via joint sample (max lp or lp__)
+    map_idx = None
+    chain_idx = None
+    draw_idx = None
+    lp_key = None
+    if idata_obj is not None and hasattr(idata_obj, "sample_stats"):
+        if "lp" in idata_obj.sample_stats:
+            lp_key = "lp"
+        elif "lp__" in idata_obj.sample_stats:
+            lp_key = "lp__"
+    if lp_key is not None:
+        lp_arr = idata_obj.sample_stats[lp_key].values
+        arr_shape = lp_arr.shape
+        chain_idx, draw_idx = np.unravel_index(np.argmax(lp_arr), arr_shape)
+        map_idx = chain_idx * arr_shape[1] + draw_idx  # For flat
+        alpha_1_map = a1_cd[chain_idx, draw_idx]
+        alpha_2_map = a2_cd[chain_idx, draw_idx]
+        n_0_map = n0_cd[chain_idx, draw_idx]
+        B_0_map = B0_cd[chain_idx, draw_idx]
+        print("MAP envelope sample indices: chain, draw, flat:", chain_idx, draw_idx, map_idx)
+    else:
+        # fallback: median
+        alpha_1_map = np.nanmedian(alpha_1_samples)
+        alpha_2_map = np.nanmedian(alpha_2_samples)
+        n_0_map = np.nanmedian(n0_lin)
+        B_0_map = np.nanmedian(B0_true)
+        print("WARNING: Could not find lp or lp__ in sample_stats, using medians instead for MAP.")
+
+    print("MAP envelope sample values used for plotting:")
+    print(f"  alpha_1: {alpha_1_map}")
+    print(f"  alpha_2: {alpha_2_map}")
+    print(f"  n_0:     {n_0_map}")
+    print(f"  B_0:     {B_0_map}")
+    f_B_map = None
+    if "f_B" in posterior_ds:
+        f_B_arr = np.asarray(posterior_ds["f_B"])
+        if f_B_arr.ndim == 2:
+            f_B_map = f_B_arr[chain_idx, draw_idx]
+        else:
+            f_B_map = f_B_arr.flatten()[map_idx]
+    elif "log10_f" in posterior_ds:
+        logf_B_arr = np.asarray(posterior_ds["log10_f"])
+        if logf_B_arr.ndim == 2:
+            f_B_map = 10 ** (logf_B_arr[chain_idx, draw_idx])
+        else:
+            f_B_map = 10 ** (logf_B_arr.flatten()[map_idx])
+    logB0_map_shifted = np.log10(B_0_map) - Ymin
+    logn0_map = np.log10(n_0_map) - Xmin
+    Y_map = model_predict(logB0_map_shifted, logn0_map,
+                          alpha_1_map, alpha_2_map,
+                          X_plot_log_shifted, Xmin, Ymin, True)
+
+    if f_B_map is not None:
+        Y_map_fb = model_predict(logB0_map_shifted + np.log10(f_B_map), logn0_map,
+                                alpha_1_map, alpha_2_map,
+                                X_plot_log_shifted, Xmin, Ymin, True)
+        plt.fill_between(X_plot, Y_map_fb, Y_map, color="red", alpha=0.15, label="$f_B$-region")
+    
+    plt.plot(X_plot, Y_map, color="red", linewidth=2, zorder=1000, label="MAP")
+    crut_x = np.logspace(np.log10(300.0), np.log10(1e10), num=200)
+    crut_y = 10.0 * ((crut_x / 300.0) ** (2.0 / 3.0))
+    plt.hlines(10.0, 9.0, 300.0, colors="k", linewidth=2, zorder=2)
+    plt.plot(crut_x, crut_y, "k", linewidth=2, label="Crutcher et al. 2010", zorder=2)
+    crut_x_1 = np.logspace(np.log10(0.000001), np.log10(0.4e4), num=200)
+    crut_y_1 = 95 * ((crut_x_1 / 0.4e4) ** (0.15))
+    plt.plot(crut_x_1, crut_y_1, "k--", linewidth=2, zorder=2)
+    crut_x_2 = np.logspace(np.log10(0.4e4), np.log10(1e10), num=200)
+    crut_y_2 = 95 * ((crut_x_2 / 0.4e4) ** (0.53))
+    plt.plot(crut_x_2, crut_y_2, "k--", linewidth=2,label="Whitworth et al. 2025", zorder=2)
+    X_raw = _to_linear_from_shifted_log(X, Xmin)
+    Y_raw = _to_linear_from_shifted_log(Y, Ymin)
+    Yerr_linear = np.where(np.isfinite(Y_raw) & np.isfinite(Yerr), Yerr * Y_raw * np.log(10.0), np.nan)
+    Xerr_linear = np.where(np.isfinite(X_raw) & np.isfinite(Xerr), Xerr * X_raw * np.log(10.0), np.nan)
+    plt.errorbar(X_raw, Y_raw, yerr=Yerr_linear,
+                 fmt="o", color="black", alpha=0.25)#, label="data")     #xerr=Xerr_linear, 
+    plt.xscale("log"); plt.yscale("log")
+    plt.ylim(0.01, 1e6)
+    #plt.xlim(0.001, 2e7)
+    plt.xlim(8.0, 2e7)          #for zeeman data
+    plt.tick_params(labelsize=20, width=2, length=10)
+    plt.xlabel(r"$n$ [cm$^{-3}$]", fontsize=26)
+    plt.ylabel(r"$B_{\rm z}$ [$\mu$G]", fontsize=26)
+    plt.legend(loc="upper left", fontsize = 18, ncol = 2)
+    plt.grid(which="major", axis="both")
+    plt.tight_layout()
+    plt.savefig(f"{outdir}posterior_fit_.png")
+    plt.show()
+    plt.close()
+    print("saved file", f"{outdir}posterior_fit_.png")
+
+
+def plot_corner(idata, file_suffix="", outdir=""):
+
+    def get_param(posterior, names, fallback=None):
+        for n in names:
+            if n in posterior:
+                arr = posterior[n].values
+                if arr.ndim == 2:
+                    arr_flat = arr.flatten()
+                    if arr_flat.size and not np.all(np.isnan(arr_flat)):
+                        return arr
+                elif arr.ndim == 1:
+                    if arr.size and not np.all(np.isnan(arr)):
+                        return arr
+                continue
+        if fallback is not None:
+            return fallback * np.ones([1])
+        return None
+
+    posterior = idata.posterior
+
+    alpha_1 = get_param(posterior, ["alpha_1"])
+    alpha_2 = get_param(posterior, ["alpha_2"])
+    n_0 = get_param(posterior, ["n_0"])
+    B_0 = get_param(posterior, ["B_0"])
+    f_B = get_param(posterior, ["log10_f"])
+
+    arrs = []
+    labels = []
+
+    if alpha_1 is not None:
+        arrs.append(alpha_1)
+        labels.append(r"$\alpha_1$")
+    if alpha_2 is not None:
+        arrs.append(alpha_2)
+        labels.append(r"$\alpha_2$")
+    if n_0 is not None:
+        arrs.append(np.log10(n_0))
+        labels.append(r"$\log_{10} \, n_0\,({\rm cm}^{-3})$")
+    if B_0 is not None:
+        arrs.append(np.log10(B_0))
+        labels.append(r"$\log_{10}\, B_0\,(\mu{\rm G})$")
+    if f_B is not None:
+        arrs.append(np.log10(f_B))
+        labels.append(r"$\log_{10}\,f_B$")
+
+    valid_samples = []
+    valid_labels = []
+    min_len = None
+
+    for arr, lab in zip(arrs, labels):
+        arr_flat = np.asarray(arr).flatten()
+        arr_flat = arr_flat[np.isfinite(arr_flat) & (np.abs(arr_flat) < 1e10)]
+        if arr_flat.size > 0 and not np.all(np.isnan(arr_flat)):
+            valid_samples.append(arr_flat)
+            valid_labels.append(lab)
+            if min_len is None or arr_flat.size < min_len:
+                min_len = arr_flat.size
+
+    if len(valid_samples) == 0:
+        raise RuntimeError("No valid parameters found to plot in corner.")
+
+    samples_clipped = np.column_stack([arr[:min_len] for arr in valid_samples])
+    labels = valid_labels
+
+    fig = corner.corner(samples_clipped, labels=labels, label_kwargs=dict(fontsize=18))
+    for ax in fig.get_axes():
+        ax.tick_params(axis="both", labelsize=14)
+    plt.tight_layout()
+    if outdir:
+        import os
+        os.makedirs(outdir, exist_ok=True)
+        plt.savefig(f"{outdir}corner_{file_suffix}.png")
+    else:
+        plt.show()
+
+def check_converge(outdir=""):
+    print("Checking convergence diagnostics...")
+    if outdir and outdir[-1] != "/": outdir += "/"
+    summaryfile = f"{outdir}summary.csv"
+    with open(summaryfile, "r", encoding="utf-8") as f:
+        header = f.readline().strip().split(",")
+    header[0] = "parameter"
+    data = np.genfromtxt(summaryfile, delimiter=",", skip_header=1,
+                         names=header, dtype=None, encoding="utf-8")
+    kk = np.nonzero([("mu_" not in p) and (p[0] != "z") and ("lp__" not in p) and ("shifted" not in p) for p in data["parameter"]])[0]
+    OK = True
+    for k in kk:
+        p = data["parameter"][k]
+        try:
+            rhat, ess_bulk, ess_tail = float(data["r_hat"][k]), float(data["ess_bulk"][k]), float(data["ess_tail"][k])
+        except Exception:
+            continue
+        if rhat > 1.01:
+            print(f"{p} has Rhat = {rhat} > 1.01, indicating chains haven't converged.")
+            OK = False
+        if ess_bulk < 100:
+            print(f"{p} has ess_bulk = {ess_bulk} < 100, high autocorrelation/mixing.")
+            OK = False
+        if ess_tail < 100:
+            print(f"{p} has ess_tail = {ess_tail} < 100, poor tail exploration.")
+            OK = False
+    if OK: print("All parameters have converged!")
+    print("-----------------------------------")
+
+def post_fit(datafile, posterior, posterior_predictive=None, outdir=""):
+    data = load_data(filename=datafile)
+    X, Xerr, Xmin, Y, Yerr, Ymin = data 
+    data_orig = load_data(filename=datafile, orig=True)
+    X_lin, Xerr_lin, Xmin_lin, Y_lin, Yerr_lin, Ymin_lin = data_orig
+    X_log_abs = np.log10(X_lin)
+    if outdir and outdir[-1] != "/": outdir += "/"
+    if isinstance(posterior, str):
+        print("Loading posterior samples from netcdf...")
+        idata = az.from_netcdf(f"{outdir}" + posterior)
+    else:
+        print("Building InferenceData from CmdStan fit...")
+        idata = az.from_cmdstanpy(posterior=posterior)
+    if posterior_predictive is not None:
+        try:
+            loglik_flat = posterior_predictive.stan_variable("log_lik_y")
+        except Exception:
+            gq_df = posterior_predictive.draws_pd()
+            ll_cols = [c for c in gq_df.columns if c.startswith("log_lik_y[")]
+            if not ll_cols: raise RuntimeError("Could not find log_lik_y in fit_pp")
+            loglik_flat = gq_df[ll_cols].values
+        try:
+            draws_arr = posterior.draws(inc_warmup=False)
+            n_chain, n_draw = draws_arr.shape[:2]
+        except Exception:
+            n_chain = 4
+            n_samples_total = loglik_flat.shape[0]
+            n_draw = n_samples_total // n_chain
+        loglik_array = loglik_flat.reshape(n_chain, n_draw, loglik_flat.shape[1])
+        loglik_da = xr.DataArray(loglik_array, dims=("chain", "draw", "obs"),
+                                 coords={"chain": np.arange(n_chain),
+                                         "draw": np.arange(n_draw),
+                                         "obs": np.arange(loglik_flat.shape[1])})
+        idata.log_likelihood = xr.Dataset({"Y": loglik_da})
+        idata.observed_data = xr.Dataset({"Y": (("obs",), data[3])})
+
+    posterior = idata.posterior
+    a1_vals = posterior["alpha_1"].values
+    a2_vals = posterior["alpha_2"].values
+    log10n0_vals = get_param(posterior, ["log10(n_0)", "log10n_0_shifted", "n_0"], np.log10(300.0))
+    if log10n0_vals.shape == (1,):
+        log10n0_vals = np.full((n_draw, n_chain), log10n0_vals[0])
+    log10B0_vals = get_param(posterior, ["log10(B_0)", "log10B_0_shifted", "B_0"], np.log10(10.0))
+    sigma_y_vals = get_param(posterior, ["sigma_y"], 1e-6)
+    log10_f_B_vals = get_param(posterior, ["log10_f_B", "f_B"])
+
+    samples_shape = a1_vals.shape
+    if len(samples_shape) == 2:
+        n_chain, n_draw = samples_shape
+    elif len(samples_shape) == 1:
+        n_chain = 1
+        n_draw = samples_shape[0]
+    else:
+        raise RuntimeError("Could not infer chain/draw count from param shape.")
+    print(f"a1_vals shape: {a1_vals.shape}")
+    print(f"a2_vals shape: {a2_vals.shape}")
+    print(f"log10n0_vals shape: {log10n0_vals.shape}")
+    print(f"log10B0_vals shape: {log10B0_vals.shape}")
+    print(f"sigma_y_vals shape: {sigma_y_vals.shape}")
+    print(f"log10_f_B_vals shape: {log10_f_B_vals.shape if log10_f_B_vals is not None else None}")
+
+    a1_cd = reshape_param(a1_vals, n_chain, n_draw)
+    a2_cd = reshape_param(a2_vals, n_chain, n_draw)
+    log10n0_cd = reshape_param(log10n0_vals, n_chain, n_draw)
+    log10B0_cd = reshape_param(log10B0_vals, n_chain, n_draw)
+    sigma_y_cd = reshape_param(sigma_y_vals, n_chain, n_draw)
+    log10_f_B_cd = reshape_param(log10_f_B_vals, n_chain, n_draw) if log10_f_B_vals is not None else None
+    n_obs = X_log_abs.size
+    preds_log = np.empty((n_chain, n_draw, n_obs), dtype=float)
+    rng = np.random.default_rng()
+    Yerr_dex = np.where((Y_lin > 0) & np.isfinite(Yerr_lin), Yerr_lin / Y_lin / np.log(10.0), 0.0)
+    for c in range(n_chain):
+        for d in range(n_draw):
+            a1 = float(a1_cd[c, d])
+            a2 = float(a2_cd[c, d])
+            b0 = float(log10B0_cd[c, d])
+            n0 = float(log10n0_cd[c, d])
+            sigma_y = float(sigma_y_cd[c, d])
+            mu = np.where(X_log_abs <= n0,
+                  b0 + a1 * (X_log_abs - n0),
+                  b0 + a2 * (X_log_abs - n0))
+            if log10_f_B_cd is not None:
+                mu += float(log10_f_B_cd[c, d])
+            obs_sd_dex = np.sqrt(sigma_y ** 2 + Yerr_dex ** 2)
+            eps = rng.normal(loc=0.0, scale=obs_sd_dex, size=n_obs)
+            preds_log[c, d, :] = mu + eps
+    preds_da = xr.DataArray(preds_log, dims=("chain", "draw", "obs"),
+                            coords={"chain": np.arange(n_chain),
+                                    "draw": np.arange(n_draw),
+                                    "obs": np.arange(n_obs)})
+    new_pp = xr.Dataset({"y_rep": preds_da})
+    idata.posterior_predictive = new_pp
+    try:
+        Xmin_log = data[2]
+        Ymin_log = data[-1]
+        posterior_ds = idata.posterior
+        if "log10n_0_shifted" in posterior_ds and "log10(n_0)" not in posterior_ds:
+            log10n0_abs = posterior_ds["log10n_0_shifted"].values + Xmin_log
+            dims = posterior_ds["log10n_0_shifted"].dims
+            idata.posterior = idata.posterior.assign({"log10(n_0)": xr.DataArray(log10n0_abs, dims=dims)})
+            idata.posterior = idata.posterior.assign({"n_0": xr.DataArray(10 ** log10n0_abs, dims=dims)})
+        elif "log10(n_0)" in posterior_ds and "n_0" not in posterior_ds:
+            log10n0_abs = posterior_ds["log10(n_0)"].values
+            dims = posterior_ds["log10(n_0)"].dims
+            idata.posterior = idata.posterior.assign({"n_0": xr.DataArray(10 ** log10n0_abs, dims=dims)})
+        if "log10B_0_shifted" in posterior_ds and "log10(B_0)" not in posterior_ds:
+            log10B0_abs = posterior_ds["log10B_0_shifted"].values + Ymin_log
+            dims = posterior_ds["log10B_0_shifted"].dims
+            idata.posterior = idata.posterior.assign({"log10(B_0)": xr.DataArray(log10B0_abs, dims=dims)})
+            idata.posterior = idata.posterior.assign({"B_0": xr.DataArray(10 ** log10B0_abs, dims=dims)})
+        elif "log10(B_0)" in posterior_ds and "B_0" not in posterior_ds:
+            log10B0_abs = posterior_ds["log10(B_0)"].values
+            dims = posterior_ds["log10(B_0)"].dims
+            idata.posterior = idata.posterior.assign({"B_0": xr.DataArray(10 ** log10B0_abs, dims=dims)})
+    except Exception as e:
+        print("Failed to attach canonical parameter names:", e)
+    idata.to_netcdf(f"{outdir}fit_fb.nc")
+    az.summary(idata).to_csv(f"{outdir}summary.csv")
+    posterior_predictive_plot(idata.posterior_predictive, data_orig, Ymin, file_suffix="", outdir=outdir)
+    posterior_fit(idata, load_data(filename=datafile), num_lines=100, file_suffix="", outdir=outdir)
+    plot_corner(idata, file_suffix="", outdir=outdir)
+    check_converge(outdir=outdir)
+    return idata
+
+def setup_Stan_model(outdir):
+    stan_model = """
+data {
+  int<lower=0> n_obs;
+  vector[n_obs] X;
+  vector[n_obs] Y;
+  vector[n_obs] Yerr;
+  real X_min;
+  real Y_min;
+}
+parameters {
+  //vector[n_obs] z_X_true;
+  real<lower= -10 -X_min> log10B_0_shifted;
+  real<lower= -10 -Y_min> log10n_0_shifted;
+  real<lower=0> alpha_1;
+  real<lower=0> alpha_2;
+  real<lower=log10(1e-4), upper=log10(1)> log10_f;  // Fixed: log-space like f_B
+  real<lower=0> sigma_y;
+}
+transformed parameters {
+  real R = 9;                                    // Your fixed R value     CHANGE THIS FOR WHAT VALUE YOU WANT - 2,5,9 etc
+  real fixed_Xerr = log10(R);
+  
+  // VECTORIZED ✓ (like working model)
+  vector[n_obs] X_true = X + fixed_Xerr; // * z_X_true;
+  
+  // LOOP (can't vectorize if-statement, like working model)
+  vector[n_obs] envelope;
+  for (i in 1:n_obs) {
+    real X_true_abs = X_true[i] + X_min;
+    real log10n0_abs = log10n_0_shifted + X_min;
+    if (X_true_abs < log10n0_abs) {
+      envelope[i] = log10B_0_shifted + alpha_1 * (X_true_abs - log10n0_abs);
+    } else {
+      envelope[i] = log10B_0_shifted + alpha_2 * (X_true_abs - log10n0_abs);
+    }
+  }
+}
+model {
+  //z_X_true ~ normal(0, 1);
+  log10B_0_shifted ~ normal(0, 2);
+  log10n_0_shifted ~ normal(0, 2);
+  alpha_1 ~ normal(0.5, 0.5);
+  alpha_2 ~ normal(0.5, 0.5);
+  log10_f ~ normal(0,1.0);    // Fixed: prior on log10_f
+  sigma_y ~ normal(0,1.0);    // Fixed: realistic prior
+
+  // VECTORIZED likelihood
+  {
+    vector[n_obs] log10_B_pred = envelope + log10_f;  //
+    log10_B_pred = fmax(-20, fmin(20, log10_B_pred)); // wide clamp to stop numerical issues close to zero
+    //vector[n_obs] sigma_total = fmax(0.01, sqrt(square(sigma_y) + square(Yerr)));
+    vector[n_obs] sigma_total = sqrt(square(sigma_y) + square(Yerr));
+    Y ~ normal(log10_B_pred, sigma_total);
+  }
+}
+generated quantities {
+  vector[n_obs] y_rep;
+  vector[n_obs] log_lik_y;
+  for (i in 1:n_obs) {
+    real log10_B_pred_shifted = envelope[i] + log10_f;  // Direct log10_f
+    y_rep[i] = normal_rng(log10_B_pred_shifted, sqrt(square(sigma_y) + square(Yerr[i])));
+    log_lik_y[i] = normal_lpdf(Y[i] | log10_B_pred_shifted, sqrt(square(sigma_y) + square(Yerr[i])));
+  }
+}
+"""
+    if outdir and outdir[-1] != "/": outdir += "/"
+    with open(f"{outdir}model.stan", "w") as f:
+        f.write(stan_model)
+
+def run_model(data, outdir):
+    if outdir and outdir[-1] != "/": outdir += "/"
+    stan_file = f"{outdir}model.stan"
+    setup_Stan_model(outdir=outdir)
+    X, Xerr, Xmin, Y, Yerr, Ymin = data
+    n_obs = len(X)
+    stan_data = {"n_obs": n_obs, "X": X, "Xerr": Xerr, "Y": Y, "Yerr": Yerr, "X_min": float(Xmin), "Y_min": float(Ymin)}
+    model = CmdStanModel(stan_file=stan_file)
+    cmdstanpy_logger = logging.getLogger("cmdstanpy")
+    for h in list(cmdstanpy_logger.handlers): cmdstanpy_logger.removeHandler(h)
+    handler = logging.FileHandler(f"{outdir}all.log")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    cmdstanpy_logger.addHandler(handler)
+    cmdstanpy_logger.setLevel(logging.DEBUG)
+    SEED = 1234
+    rng = np.random.default_rng(SEED)
+    #rng = np.random.default_rng()
+    mu_n_0 = float(np.mean(X))
+    mu_B_0 = float(np.mean(Y))
+    init_values = []
+    for chain_id in range(4):
+        # DIFFERENT but REPRODUCIBLE inits per chain
+        iv = {
+            "log10B_0_shifted": float(mu_B_0 + 0.5 * chain_id),
+            "log10n_0_shifted": float(mu_n_0 + 0.5 * chain_id),
+            "sigma_y": 0.05 + 0.1 * chain_id,
+            "alpha_1": 0.1 + 0.05 * chain_id,
+            "alpha_2": 0.7 + 0.05 * chain_id,
+            #"z_X_true": (chain_id * 0.1 + rng.normal(0, 0.05, n_obs)).clip(-2, 2).tolist(),
+            "log10_f": -1.0 + 0.2 * chain_id,
+        }
+        init_values.append(iv)
+    fit = model.sample(
+        data=stan_data, chains=4, inits=init_values,
+        seed=SEED,
+        threads_per_chain=4,
+        iter_sampling=5000, iter_warmup=5000,
+        adapt_delta=0.9, max_treedepth=12,
+        show_console=True
+    )
+    fit_pp = model.generate_quantities(data=stan_data, mcmc_sample=fit, seed=SEED)
+    return fit, fit_pp
+
+if __name__ == "__main__":
+    #datafile = 'path/to/ds1'
+    #datafile = 'path/to/ds2'
+    #datafile = 'path/to/ds3'
+    #datafile = 'path/to/ds4'
+
+    #outdir = 'output/path/for/ds1'
+    #outdir = 'output/path/for/ds2'  
+    #outdir = 'output/path/for/ds3'
+    #outdir = 'output/path/for/ds4'
+    
+    data = load_data(filename=datafile)  # shifted-log by default
+    fit, fit_pp = run_model(data, outdir=outdir)
+    post_fit(datafile, posterior=fit, posterior_predictive=fit_pp, outdir=outdir)
+    result = summary_table(outdir=outdir)
+    print(result)
