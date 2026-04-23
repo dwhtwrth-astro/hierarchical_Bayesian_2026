@@ -676,66 +676,57 @@ def post_fit(datafile, posterior, posterior_predictive=None, outdir=""):
 def setup_Stan_model(outdir):
     stan_model = """
 data {
-  int<lower=0> n_obs;
-  vector[n_obs] X;
-  vector[n_obs] Y;
-  vector[n_obs] Yerr;
-  real X_min;
+  int<lower=1> n_obs;
+  vector[n_obs] X;         // observed log10(n)
+  vector[n_obs] Y;         // observed log10(B)
+  vector[n_obs] Yerr;      // observed uncertainty in log10(B)
+  real X_min;              // for scaling, if needed
   real Y_min;
+  real<lower=0> R_n;
 }
 parameters {
-  //vector[n_obs] z_X_true;
-  real<lower= -10 -X_min> log10B_0_shifted;
-  real<lower= -10 -Y_min> log10n_0_shifted;
+  real log10B_0_shifted;
+  real log10n_0_shifted;
   real<lower=0> alpha_1;
   real<lower=0> alpha_2;
-  real<lower=log10(1e-4), upper=log10(1)> log10_f;  // Fixed: log-space like f_B
-  real<lower=0> sigma_y;
+  real<lower=0> sigma_y;         // intrinsic scatter in log10(B)
+  // Any other model parameters as in your envelope
 }
 transformed parameters {
-  real R = 9;                                    // Your fixed R value     CHANGE THIS FOR WHAT VALUE YOU WANT - 2,5,9 etc
-  real fixed_Xerr = log10(R);
-  
-  // VECTORIZED ✓ (like working model)
-  vector[n_obs] X_true = X + fixed_Xerr; // * z_X_true;
-  
-  // LOOP (can't vectorize if-statement, like working model)
   vector[n_obs] envelope;
+  real log10n_0_abs = log10n_0_shifted + X_min;
+  real log10B_0_abs = log10B_0_shifted + Y_min;
   for (i in 1:n_obs) {
-    real X_true_abs = X_true[i] + X_min;
-    real log10n0_abs = log10n_0_shifted + X_min;
-    if (X_true_abs < log10n0_abs) {
-      envelope[i] = log10B_0_shifted + alpha_1 * (X_true_abs - log10n0_abs);
+    real X_abs = X[i] + X_min;
+    if (X_abs < log10n_0_abs) {
+      envelope[i] = log10B_0_shifted + alpha_1 * (X_abs - log10n_0_abs);
     } else {
-      envelope[i] = log10B_0_shifted + alpha_2 * (X_true_abs - log10n0_abs);
+      envelope[i] = log10B_0_shifted + alpha_2 * (X_abs - log10n_0_abs);
     }
   }
 }
 model {
-  //z_X_true ~ normal(0, 1);
+  // Priors (customize as needed)
   log10B_0_shifted ~ normal(0, 2);
   log10n_0_shifted ~ normal(0, 2);
   alpha_1 ~ normal(0.5, 0.5);
   alpha_2 ~ normal(0.5, 0.5);
-  log10_f ~ normal(0,1.0);    // Fixed: prior on log10_f
-  sigma_y ~ normal(0,1.0);    // Fixed: realistic prior
+  sigma_y ~ normal(0, 1);
 
-  // VECTORIZED likelihood
-  {
-    vector[n_obs] log10_B_pred = envelope + log10_f;  //
-    log10_B_pred = fmax(-20, fmin(20, log10_B_pred)); // wide clamp to stop numerical issues close to zero
-    //vector[n_obs] sigma_total = fmax(0.01, sqrt(square(sigma_y) + square(Yerr)));
-    vector[n_obs] sigma_total = sqrt(square(sigma_y) + square(Yerr));
-    Y ~ normal(log10_B_pred, sigma_total);
+  // ---- BEGIN: FIXED SCATTER WIDTH ----
+  for (i in 1:n_obs) {
+    real sigma_total = sqrt(square(sigma_y) + square(Yerr[i]) + square(R_n));   // add fixed log-n scatter in quadrature
+    Y[i] ~ normal(envelope[i], sigma_total);
   }
+  // ---- END: FIXED SCATTER WIDTH ----
 }
 generated quantities {
   vector[n_obs] y_rep;
-  vector[n_obs] log_lik_y;
+  vector[n_obs] log_lik_y;  // ADD THIS LINE
   for (i in 1:n_obs) {
-    real log10_B_pred_shifted = envelope[i] + log10_f;  // Direct log10_f
-    y_rep[i] = normal_rng(log10_B_pred_shifted, sqrt(square(sigma_y) + square(Yerr[i])));
-    log_lik_y[i] = normal_lpdf(Y[i] | log10_B_pred_shifted, sqrt(square(sigma_y) + square(Yerr[i])));
+    real sigma_total = sqrt(square(sigma_y) + square(Yerr[i]) + square(R_n));
+    y_rep[i] = normal_rng(envelope[i], sigma_total);
+    log_lik_y[i] = normal_lpdf(Y[i] | envelope[i], sigma_total);
   }
 }
 """
@@ -749,7 +740,7 @@ def run_model(data, outdir):
     setup_Stan_model(outdir=outdir)
     X, Xerr, Xmin, Y, Yerr, Ymin = data
     n_obs = len(X)
-    stan_data = {"n_obs": n_obs, "X": X, "Xerr": Xerr, "Y": Y, "Yerr": Yerr, "X_min": float(Xmin), "Y_min": float(Ymin)}
+    stan_data = {"n_obs": n_obs, "X": X, "Xerr": Xerr, "Y": Y, "Yerr": Yerr, "X_min": float(Xmin), "Y_min": float(Ymin), "R_n": 0.3} #set R_n to desired value (e.g., 0.70, 0.95, etc.)
     model = CmdStanModel(stan_file=stan_file)
     cmdstanpy_logger = logging.getLogger("cmdstanpy")
     for h in list(cmdstanpy_logger.handlers): cmdstanpy_logger.removeHandler(h)
