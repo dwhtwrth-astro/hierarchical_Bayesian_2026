@@ -689,13 +689,12 @@ parameters {
   real log10n_0_shifted;
   real<lower=0> alpha_1;
   real<lower=0> alpha_2;
-  real<lower=0> sigma_y;         // intrinsic scatter in log10(B)
-  // Any other model parameters as in your envelope
+  real<lower=log10(1e-4), upper=log10(1)> log10_f;  // log10 f_B, with a sensible prior/range
+  real<lower=0> sigma_y;
 }
 transformed parameters {
   vector[n_obs] envelope;
   real log10n_0_abs = log10n_0_shifted + X_min;
-  real log10B_0_abs = log10B_0_shifted + Y_min;
   for (i in 1:n_obs) {
     real X_abs = X[i] + X_min;
     if (X_abs < log10n_0_abs) {
@@ -706,27 +705,27 @@ transformed parameters {
   }
 }
 model {
-  // Priors (customize as needed)
   log10B_0_shifted ~ normal(0, 2);
   log10n_0_shifted ~ normal(0, 2);
   alpha_1 ~ normal(0.5, 0.5);
   alpha_2 ~ normal(0.5, 0.5);
-  sigma_y ~ normal(0, 1);
+  log10_f ~ normal(0, 1.0);
+  sigma_y ~ normal(0, 1.0);
 
-  // ---- BEGIN: FIXED SCATTER WIDTH ----
+  vector[n_obs] log10_B_pred = envelope + log10_f;
   for (i in 1:n_obs) {
-    real sigma_total = sqrt(square(sigma_y) + square(Yerr[i]) + square(R_n));   // add fixed log-n scatter in quadrature
-    Y[i] ~ normal(envelope[i], sigma_total);
+    real sigma_total = sqrt(square(sigma_y) + square(Yerr[i]) + square(R_n));
+    Y[i] ~ normal(log10_B_pred[i], sigma_total);
   }
-  // ---- END: FIXED SCATTER WIDTH ----
 }
 generated quantities {
   vector[n_obs] y_rep;
-  vector[n_obs] log_lik_y;  // ADD THIS LINE
+  vector[n_obs] log_lik_y;
   for (i in 1:n_obs) {
+    real log10_B_pred_shifted = envelope[i] + log10_f;
     real sigma_total = sqrt(square(sigma_y) + square(Yerr[i]) + square(R_n));
-    y_rep[i] = normal_rng(envelope[i], sigma_total);
-    log_lik_y[i] = normal_lpdf(Y[i] | envelope[i], sigma_total);
+    y_rep[i] = normal_rng(log10_B_pred_shifted, sigma_total);
+    log_lik_y[i] = normal_lpdf(Y[i] | log10_B_pred_shifted, sigma_total);
   }
 }
 """
