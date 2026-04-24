@@ -725,7 +725,7 @@ parameters {
   real<lower= -10 -X_min> log10B_0_shifted;
   real<lower= -10 -Y_min> log10n_0_shifted;
   real<lower=0, upper = 1> alpha_1;
-  real<lower=0, upper = 1> alpha_2
+  real<lower=0, upper = 1> alpha_2;
   real<lower=log10(1e-1), upper=log10(5e1)> log10_f_n;
   real<lower=log10(1e-4), upper=log10(1)> log10_f_B_1;   // Low density regime
   real<lower=log10(1e-4), upper=log10(1)> log10_f_B_2;   // High density regime
